@@ -1,0 +1,6 @@
+duckdb>=1.4.0
+cloudscraper>=1.2.70
+requests>=2.32.0
+zstandard>=0.25.0
+# Steam API library
+git+https://github.com/solsticegamestudios/steam#egg=steam[client]
