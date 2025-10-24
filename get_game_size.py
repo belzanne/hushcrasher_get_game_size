@@ -26,8 +26,6 @@ load_dotenv()
 STEAM_DB_PATH = os.getenv('STEAM_DB_PATH')
 GAME_SIZES_DB_PATH = os.getenv('GAME_SIZES_DB_PATH')
 BATCH_SIZE = 200
-REQUEST_DELAY_MIN = 0.5
-REQUEST_DELAY_MAX = 1.0
 MAX_RETRIES = 2
 
 class SteamGameSizesToDuckDB:
@@ -63,7 +61,7 @@ class SteamGameSizesToDuckDB:
             # Créer la base de données si elle n'existe pas
             self.db_conn = duckdb.connect(GAME_SIZES_DB_PATH)
             
-            # Créer la table si elle n'existe pas
+            # Créer la table des tailles de jeux si elle n'existe pas
             create_table_query = """
             CREATE TABLE IF NOT EXISTS game_sizes (
                 app_id INTEGER,
@@ -76,6 +74,18 @@ class SteamGameSizesToDuckDB:
             """
             
             self.db_conn.execute(create_table_query)
+            
+            # Créer la table des app_id échoués si elle n'existe pas
+            create_failed_table_query = """
+            CREATE TABLE IF NOT EXISTS failed_app_ids (
+                app_id INTEGER PRIMARY KEY,
+                error_count INTEGER DEFAULT 1,
+                last_failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+            
+            self.db_conn.execute(create_failed_table_query)
             self.logger.info(f"✅ Base de données configurée: {GAME_SIZES_DB_PATH}")
             
             # Vérifier combien d'AppID ont déjà été traités
@@ -132,14 +142,22 @@ class SteamGameSizesToDuckDB:
                 processed_query = "SELECT DISTINCT app_id FROM game_sizes"
                 processed_result = game_sizes_conn.execute(processed_query).fetchall()
                 processed_app_ids = set(row[0] for row in processed_result)
+                
+                # Récupérer les AppID qui ont échoué
+                failed_query = "SELECT app_id FROM failed_app_ids"
+                failed_result = game_sizes_conn.execute(failed_query).fetchall()
+                failed_app_ids = set(row[0] for row in failed_result)
+                
                 game_sizes_conn.close()
             else:
                 processed_app_ids = set()
+                failed_app_ids = set()
             
-            # Filtrer les AppID non traités
-            app_ids = [app_id for app_id in all_app_ids if app_id not in processed_app_ids]
+            # Filtrer les AppID non traités et non échoués
+            app_ids = [app_id for app_id in all_app_ids if app_id not in processed_app_ids and app_id not in failed_app_ids]
             
             self.logger.info(f"📊 Récupéré {len(app_ids)} app_id non traités depuis la base de données")
+            self.logger.info(f"📊 Exclus: {len(processed_app_ids)} déjà traités, {len(failed_app_ids)} échoués précédemment")
             return app_ids
             
         except Exception as e:
@@ -179,11 +197,30 @@ class SteamGameSizesToDuckDB:
                 #self.logger.warning(f"⚠️ Erreur pour app_id {app_id} (tentative {attempt + 1}): {e}")
                 
                 if attempt < MAX_RETRIES - 1:
-                    delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
+                    # Délai seulement lors des tentatives de retry (0.5 à 1.5 sec)
+                    delay = random.uniform(0.5, 1.5)
                     time.sleep(delay)
         
         self.logger.error(f"❌ Échec pour app_id {app_id} après {MAX_RETRIES} tentatives")
+        self.record_failed_app_id(app_id)
         return None
+    
+    def record_failed_app_id(self, app_id: int):
+        """Enregistre un app_id qui a échoué dans la base de données"""
+        try:
+            # Utiliser INSERT OR REPLACE pour mettre à jour le compteur d'erreurs
+            insert_query = """
+            INSERT OR REPLACE INTO failed_app_ids (app_id, error_count, last_failed_at)
+            VALUES (?, 
+                    COALESCE((SELECT error_count FROM failed_app_ids WHERE app_id = ?), 0) + 1,
+                    CURRENT_TIMESTAMP)
+            """
+            
+            self.db_conn.execute(insert_query, (app_id, app_id))
+            self.db_conn.commit()
+            
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors de l'enregistrement de l'app_id échoué {app_id}: {e}")
     
     def save_batch_to_db(self, batch_data: List[Dict]):
         """Sauvegarde d'un batch de données dans DuckDB"""
@@ -237,10 +274,7 @@ class SteamGameSizesToDuckDB:
                 else:
                     failed += 1
                 
-                # Délai entre les requêtes (léger car API officielle)
-                if i < len(app_ids):
-                    delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-                    time.sleep(delay)
+                # Pas de délai entre les requêtes normales pour optimiser la vitesse
                 
                 # Log de progression
                 if i % 50 == 0 or i == len(app_ids):
@@ -287,7 +321,7 @@ class SteamGameSizesToDuckDB:
                     
                     # Pause entre les batches
                     if batch_number < len(batches):
-                        pause_duration = random.uniform(2, 5)
+                        pause_duration = random.uniform(0.2, 1)
                         self.logger.info(f"⏸️ Pause entre batches de {pause_duration:.1f}s")
                         time.sleep(pause_duration)
                 
