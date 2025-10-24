@@ -176,7 +176,7 @@ class SteamGameSizesToDuckDB:
                 return depot_data_list if depot_data_list else None
                 
             except Exception as e:
-                self.logger.warning(f"⚠️ Erreur pour app_id {app_id} (tentative {attempt + 1}): {e}")
+                #self.logger.warning(f"⚠️ Erreur pour app_id {app_id} (tentative {attempt + 1}): {e}")
                 
                 if attempt < MAX_RETRIES - 1:
                     delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
