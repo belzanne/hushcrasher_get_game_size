@@ -26,7 +26,6 @@ load_dotenv()
 STEAM_DB_PATH = os.getenv('STEAM_DB_PATH')
 GAME_SIZES_DB_PATH = os.getenv('GAME_SIZES_DB_PATH')
 BATCH_SIZE = 200
-MAX_RETRIES = 2
 
 class SteamGameSizesToDuckDB:
     def __init__(self):
@@ -58,9 +57,18 @@ class SteamGameSizesToDuckDB:
     def setup_database(self):
         """Configuration de la base de données DuckDB"""
         try:
-            # Créer la base de données si elle n'existe pas
-            self.db_conn = duckdb.connect(GAME_SIZES_DB_PATH)
+            # Créer les tables si elles n'existent pas
+            self.create_tables_if_not_exist()
+            self.logger.info(f"✅ Base de données configurée: {GAME_SIZES_DB_PATH}")
             
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors de la configuration de la base de données: {e}")
+            raise
+    
+    def create_tables_if_not_exist(self):
+        """Crée les tables si elles n'existent pas"""
+        conn = duckdb.connect(GAME_SIZES_DB_PATH)
+        try:
             # Créer la table des tailles de jeux si elle n'existe pas
             create_table_query = """
             CREATE TABLE IF NOT EXISTS game_sizes (
@@ -73,7 +81,7 @@ class SteamGameSizesToDuckDB:
             )
             """
             
-            self.db_conn.execute(create_table_query)
+            conn.execute(create_table_query)
             
             # Créer la table des app_id échoués si elle n'existe pas
             create_failed_table_query = """
@@ -85,16 +93,9 @@ class SteamGameSizesToDuckDB:
             )
             """
             
-            self.db_conn.execute(create_failed_table_query)
-            self.logger.info(f"✅ Base de données configurée: {GAME_SIZES_DB_PATH}")
-            
-            # Vérifier combien d'AppID ont déjà été traités
-            count_query = "SELECT COUNT(DISTINCT app_id) FROM game_sizes"
-            processed_count = self.db_conn.execute(count_query).fetchone()[0]
-            
-        except Exception as e:
-            self.logger.error(f"❌ Erreur lors de la configuration de la base de données: {e}")
-            raise
+            conn.execute(create_failed_table_query)
+        finally:
+            conn.close()
     
     def connect_to_steam(self):
         """Connexion à Steam"""
@@ -139,16 +140,17 @@ class SteamGameSizesToDuckDB:
             # Récupérer les AppID déjà traités depuis game_sizes
             if os.path.exists(GAME_SIZES_DB_PATH):
                 game_sizes_conn = duckdb.connect(GAME_SIZES_DB_PATH)
-                processed_query = "SELECT DISTINCT app_id FROM game_sizes"
-                processed_result = game_sizes_conn.execute(processed_query).fetchall()
-                processed_app_ids = set(row[0] for row in processed_result)
-                
-                # Récupérer les AppID qui ont échoué
-                failed_query = "SELECT app_id FROM failed_app_ids"
-                failed_result = game_sizes_conn.execute(failed_query).fetchall()
-                failed_app_ids = set(row[0] for row in failed_result)
-                
-                game_sizes_conn.close()
+                try:
+                    processed_query = "SELECT DISTINCT app_id FROM game_sizes"
+                    processed_result = game_sizes_conn.execute(processed_query).fetchall()
+                    processed_app_ids = set(row[0] for row in processed_result)
+                    
+                    # Récupérer les AppID qui ont échoué
+                    failed_query = "SELECT app_id FROM failed_app_ids"
+                    failed_result = game_sizes_conn.execute(failed_query).fetchall()
+                    failed_app_ids = set(row[0] for row in failed_result)
+                finally:
+                    game_sizes_conn.close()
             else:
                 processed_app_ids = set()
                 failed_app_ids = set()
@@ -166,58 +168,56 @@ class SteamGameSizesToDuckDB:
     
     def get_game_size_info(self, app_id: int) -> Optional[List[Dict]]:
         """Récupération des informations de taille pour un AppID"""
-        for attempt in range(MAX_RETRIES):
-            try:
-                depot_info = self.cdn.get_app_depot_info(app_id)
-                
-                if not depot_info:
-                    return None
-                
-                depot_data_list = []
-                
-                for depot_id, depot_data in depot_info.items():
-                    if isinstance(depot_data, dict) and 'manifests' in depot_data:
-                        manifests = depot_data.get('manifests', {})
-                        if 'public' in manifests:
-                            public_manifest = manifests['public']
-                            disk_size = int(public_manifest.get('size', 0))
-                            download_size = int(public_manifest.get('download', 0))
-                            
-                            if disk_size > 0:
-                                depot_data_list.append({
-                                    'app_id': app_id,
-                                    'depot_id': depot_id,
-                                    'disk_size': disk_size,
-                                    'download_size': download_size
-                                })
-                
-                return depot_data_list if depot_data_list else None
-                
-            except Exception as e:
-                #self.logger.warning(f"⚠️ Erreur pour app_id {app_id} (tentative {attempt + 1}): {e}")
-                
-                if attempt < MAX_RETRIES - 1:
-                    # Délai seulement lors des tentatives de retry (0.5 à 1.5 sec)
-                    delay = random.uniform(0.5, 1.5)
-                    time.sleep(delay)
-        
-        self.logger.error(f"❌ Échec pour app_id {app_id} après {MAX_RETRIES} tentatives")
-        self.record_failed_app_id(app_id)
-        return None
+        try:
+            depot_info = self.cdn.get_app_depot_info(app_id)
+            
+            if not depot_info:
+                return None
+            
+            depot_data_list = []
+            
+            for depot_id, depot_data in depot_info.items():
+                if isinstance(depot_data, dict) and 'manifests' in depot_data:
+                    manifests = depot_data.get('manifests', {})
+                    if 'public' in manifests:
+                        public_manifest = manifests['public']
+                        disk_size = int(public_manifest.get('size', 0))
+                        download_size = int(public_manifest.get('download', 0))
+                        
+                        if disk_size > 0:
+                            depot_data_list.append({
+                                'app_id': app_id,
+                                'depot_id': depot_id,
+                                'disk_size': disk_size,
+                                'download_size': download_size
+                            })
+            
+            return depot_data_list if depot_data_list else None
+            
+        except Exception as e:
+            # Pas de log d'échec individuel pour éviter le spam
+            return None
     
     def record_failed_app_id(self, app_id: int):
         """Enregistre un app_id qui a échoué dans la base de données"""
         try:
-            # Utiliser INSERT OR REPLACE pour mettre à jour le compteur d'erreurs
-            insert_query = """
-            INSERT OR REPLACE INTO failed_app_ids (app_id, error_count, last_failed_at)
-            VALUES (?, 
-                    COALESCE((SELECT error_count FROM failed_app_ids WHERE app_id = ?), 0) + 1,
-                    CURRENT_TIMESTAMP)
-            """
+            # Ouvrir une nouvelle connexion pour cet enregistrement
+            conn = duckdb.connect(GAME_SIZES_DB_PATH)
             
-            self.db_conn.execute(insert_query, (app_id, app_id))
-            self.db_conn.commit()
+            try:
+                # Utiliser INSERT OR REPLACE pour mettre à jour le compteur d'erreurs
+                insert_query = """
+                INSERT OR REPLACE INTO failed_app_ids (app_id, error_count, last_failed_at)
+                VALUES (?, 
+                        COALESCE((SELECT error_count FROM failed_app_ids WHERE app_id = ?), 0) + 1,
+                        CURRENT_TIMESTAMP)
+                """
+                
+                conn.execute(insert_query, (app_id, app_id))
+                conn.commit()  # Commit explicite
+                
+            finally:
+                conn.close()  # Fermer la connexion après le commit
             
         except Exception as e:
             self.logger.error(f"❌ Erreur lors de l'enregistrement de l'app_id échoué {app_id}: {e}")
@@ -228,34 +228,75 @@ class SteamGameSizesToDuckDB:
             if not batch_data:
                 return
             
-            # Préparer les données pour l'insertion
-            data_to_insert = []
-            for item in batch_data:
-                data_to_insert.append((
-                    item['app_id'],
-                    item['depot_id'],
-                    item['disk_size'],
-                    item['download_size']
-                ))
+            # Ouvrir une nouvelle connexion pour ce batch
+            conn = duckdb.connect(GAME_SIZES_DB_PATH)
             
-            # Insertion avec gestion des doublons (ON CONFLICT DO NOTHING)
-            insert_query = """
-            INSERT OR IGNORE INTO game_sizes (app_id, depot_id, disk_size, download_size)
-            VALUES (?, ?, ?, ?)
-            """
-            
-            self.db_conn.executemany(insert_query, data_to_insert)
-            self.db_conn.commit()
-            
-            self.logger.info(f"💾 Batch sauvegardé: {len(batch_data)} enregistrements")
+            try:
+                # Préparer les données pour l'insertion
+                data_to_insert = []
+                for item in batch_data:
+                    data_to_insert.append((
+                        item['app_id'],
+                        item['depot_id'],
+                        item['disk_size'],
+                        item['download_size']
+                    ))
+                
+                # Insertion avec gestion des doublons (ON CONFLICT DO NOTHING)
+                insert_query = """
+                INSERT OR IGNORE INTO game_sizes (app_id, depot_id, disk_size, download_size)
+                VALUES (?, ?, ?, ?)
+                """
+                
+                conn.executemany(insert_query, data_to_insert)
+                conn.commit()  # Commit explicite
+                
+                self.logger.info(f"💾 Batch sauvegardé: {len(batch_data)} enregistrements")
+                
+            finally:
+                conn.close()  # Fermer la connexion après le commit
             
         except Exception as e:
             self.logger.error(f"❌ Erreur lors de la sauvegarde du batch: {e}")
             raise
     
+    def save_failed_app_ids_batch(self, failed_app_ids: List[int]):
+        """Sauvegarde un batch d'app_id échoués dans DuckDB"""
+        try:
+            if not failed_app_ids:
+                return
+            
+            # Ouvrir une nouvelle connexion pour ce batch
+            conn = duckdb.connect(GAME_SIZES_DB_PATH)
+            
+            try:
+                # Préparer les données pour l'insertion
+                data_to_insert = []
+                for app_id in failed_app_ids:
+                    data_to_insert.append((app_id,))
+                
+                # Insertion avec gestion des doublons (ON CONFLICT DO NOTHING)
+                insert_query = """
+                INSERT OR IGNORE INTO failed_app_ids (app_id)
+                VALUES (?)
+                """
+                
+                conn.executemany(insert_query, data_to_insert)
+                conn.commit()  # Commit explicite
+                
+                self.logger.info(f"💾 Batch d'app_id échoués sauvegardé: {len(failed_app_ids)} enregistrements")
+                
+            finally:
+                conn.close()  # Fermer la connexion après le commit
+            
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors de la sauvegarde du batch d'app_id échoués: {e}")
+            raise
+    
     def scrape_batch(self, app_ids: List[int], batch_number: int):
         """Scraping d'un batch d'app_id"""
         batch_data = []
+        failed_app_ids = []  # Liste pour stocker les app_id échoués
         successful = 0
         failed = 0
         
@@ -272,21 +313,30 @@ class SteamGameSizesToDuckDB:
                     total_size = sum(item['disk_size'] for item in depot_info)
                     self.logger.debug(f"✅ AppID {app_id}: {len(depot_info)} dépôts, {total_size / (1024**3):.2f} GB")
                 else:
+                    failed_app_ids.append(app_id)
                     failed += 1
                 
                 # Pas de délai entre les requêtes normales pour optimiser la vitesse
                 
-                # Log de progression
+                # Log de progression avec pourcentage global
                 if i % 50 == 0 or i == len(app_ids):
-                    self.logger.info(f"📊 Batch {batch_number} - Progression: {i}/{len(app_ids)} ({successful} succès, {failed} échecs)")
+                    # Calculer le pourcentage global approximatif
+                    batch_progress = (batch_number - 1) * BATCH_SIZE + i
+                    global_percentage = (batch_progress / self.total_app_ids) * 100 if hasattr(self, 'total_app_ids') else 0
+                    self.logger.info(f"📊 Batch {batch_number} - Progression: {i}/{len(app_ids)} ({successful} succès, {failed} échecs) - Global: {global_percentage:.1f}%")
                 
             except Exception as e:
                 self.logger.error(f"❌ Erreur inattendue pour app_id {app_id}: {e}")
+                failed_app_ids.append(app_id)
                 failed += 1
         
         # Sauvegarder le batch dans la base de données
         if batch_data:
             self.save_batch_to_db(batch_data)
+        
+        # Sauvegarder les app_id échoués par batch
+        if failed_app_ids:
+            self.save_failed_app_ids_batch(failed_app_ids)
         
         self.logger.info(f"✅ Batch {batch_number} terminé: {successful} succès, {failed} échecs")
         return successful, failed
@@ -308,43 +358,55 @@ class SteamGameSizesToDuckDB:
             # Division en batches
             batches = [app_ids[i:i + BATCH_SIZE] for i in range(0, len(app_ids), BATCH_SIZE)]
             
-            self.logger.info(f"🎯 Début du scraping: {len(app_ids)} app_id répartis en {len(batches)} batches")
+            self.logger.info(f"🎯 Début du scraping: {len(app_ids):,} app_id répartis en {len(batches)} batches")
+            self.logger.info(f"📊 Suivi de progression: Logs tous les 3,000 app_id traités")
+            
+            # Stocker le total pour le calcul de pourcentage global
+            self.total_app_ids = len(app_ids)
             
             total_successful = 0
             total_failed = 0
+            total_processed = 0  # Compteur total pour le suivi de progression
             
             for batch_number, batch_app_ids in enumerate(batches, 1):
                 try:
                     successful, failed = self.scrape_batch(batch_app_ids, batch_number)
                     total_successful += successful
                     total_failed += failed
+                    total_processed += len(batch_app_ids)
                     
-                    # Pause entre les batches
-                    if batch_number < len(batches):
-                        pause_duration = random.uniform(0.2, 1)
-                        self.logger.info(f"⏸️ Pause entre batches de {pause_duration:.1f}s")
-                        time.sleep(pause_duration)
+                    # Log de progression tous les 3000 app_id traités
+                    if total_processed % 1000 == 0 or batch_number == len(batches):
+                        percentage = (total_processed / len(app_ids)) * 100
+                        self.logger.info(f"📊 PROGRESSION: {total_processed:,}/{len(app_ids):,} app_id traités ({percentage:.1f}%) - {total_successful:,} succès, {total_failed:,} échecs")
+                    
+                    # Pas de pause entre les batches pour maximiser la vitesse
                 
                 except Exception as e:
                     self.logger.error(f"❌ Erreur lors du traitement du batch {batch_number}: {e}")
                     total_failed += len(batch_app_ids)
+                    total_processed += len(batch_app_ids)
             
             # Résumé final
+            final_percentage = (total_processed / len(app_ids)) * 100
             self.logger.info(f"🎉 Scraping terminé!")
-            self.logger.info(f"📊 Résumé: {total_successful} succès, {total_failed} échecs")
+            self.logger.info(f"📊 Résumé final: {total_processed:,}/{len(app_ids):,} app_id traités ({final_percentage:.1f}%)")
+            self.logger.info(f"📈 Détail: {total_successful:,} succès, {total_failed:,} échecs")
             
             # Statistiques finales
-            stats_query = "SELECT COUNT(DISTINCT app_id), COUNT(*) FROM game_sizes"
-            stats = self.db_conn.execute(stats_query).fetchone()
-            self.logger.info(f"📈 Total dans la base: {stats[0]} AppID, {stats[1]} dépôts")
+            conn = duckdb.connect(GAME_SIZES_DB_PATH)
+            try:
+                stats_query = "SELECT COUNT(DISTINCT app_id), COUNT(*) FROM game_sizes"
+                stats = conn.execute(stats_query).fetchone()
+                self.logger.info(f"📈 Total dans la base: {stats[0]} AppID, {stats[1]} dépôts")
+            finally:
+                conn.close()
             
         except Exception as e:
             self.logger.error(f"❌ Erreur fatale lors du scraping: {e}")
             raise
         finally:
             self.disconnect_from_steam()
-            if hasattr(self, 'db_conn'):
-                self.db_conn.close()
 
 def main():
     """Fonction principale"""
